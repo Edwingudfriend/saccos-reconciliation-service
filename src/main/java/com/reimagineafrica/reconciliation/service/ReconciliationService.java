@@ -7,16 +7,11 @@ import com.reimagineafrica.reconciliation.dto.GatewayTransaction;
 import com.reimagineafrica.reconciliation.dto.request.ResolveDiscrepancyRequest;
 import com.reimagineafrica.reconciliation.dto.request.ReconciliationRunRequest;
 import com.reimagineafrica.reconciliation.dto.response.ReconciliationSummary;
-import com.reimagineafrica.reconciliation.entity.ReconciliationRecord;
-import com.reimagineafrica.reconciliation.entity.ReconciliationRun;
-import com.reimagineafrica.reconciliation.entity.UnmatchedPayment;
-import com.reimagineafrica.reconciliation.enums.PaymentProvider;
+import com.reimagineafrica.reconciliation.entity.*;
 import com.reimagineafrica.reconciliation.enums.ReconciliationStatus;
 import com.reimagineafrica.reconciliation.event.ReconciliationEventPublisher;
 import com.reimagineafrica.reconciliation.exception.BusinessException;
-import com.reimagineafrica.reconciliation.repository.ReconciliationRecordRepository;
-import com.reimagineafrica.reconciliation.repository.ReconciliationRunRepository;
-import com.reimagineafrica.reconciliation.repository.UnmatchedPaymentRepository;
+import com.reimagineafrica.reconciliation.repository.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
@@ -41,14 +36,23 @@ public class ReconciliationService {
     private final MobileMoneyServiceClient mobileMoneyClient;
     private final ReconciliationEngine engine;
     private final ReconciliationEventPublisher eventPublisher;
-
-    // ── Run Reconciliation ───────────────────────────────────────────
+    private final ReconciliationConfigService configService;
 
     @Transactional
     public ReconciliationRun runReconciliation(ReconciliationRunRequest request, String triggeredBy) {
         LocalDate date = request.getDate() != null ? request.getDate() : LocalDate.now().minusDays(1);
 
-        // Prevent duplicate runs
+        // Resolve per-SACCO config
+        ReconciliationConfig config = configService.resolveConfig(request.getSaccoCode());
+
+        // Validate provider is active for this SACCO
+        if (!config.getActiveProviders().contains(request.getProvider())) {
+            throw new BusinessException(String.format(
+                "Provider %s is not configured for SACCO %s. Active providers: %s",
+                request.getProvider(), request.getSaccoCode(), config.getActiveProviders()));
+        }
+
+        // Prevent duplicate completed runs
         runRepository.findBySaccoCodeAndProviderAndReconciliationDate(
                 request.getSaccoCode(), request.getProvider(), date)
                 .ifPresent(existing -> {
@@ -69,26 +73,22 @@ public class ReconciliationService {
                 .build();
 
         runRepository.save(run);
-        log.info("Starting reconciliation run: {} / {} / {}", request.getSaccoCode(), request.getProvider(), date);
+        log.info("Starting reconciliation: {} / {} / {} (tolerance: {} TZS, strict: {})",
+                request.getSaccoCode(), request.getProvider(), date,
+                config.getAmountTolerance(), config.getStrictReferenceMatch());
 
         try {
-            // 1. Fetch gateway transactions
             List<GatewayTransaction> gatewayTxns = mobileMoneyClient
                     .getTransactions(request.getSaccoCode(), request.getProvider(), date);
-
-            // 2. Fetch Fineract transactions
             List<FineractTransaction> fineractTxns = fineractClient.getLoanTransactions(date);
 
             run.setTotalGatewayTransactions(gatewayTxns.size());
             run.setTotalFineractTransactions(fineractTxns.size());
 
-            // 3. Run matching engine
-            List<ReconciliationRecord> records = engine.match(run, gatewayTxns, fineractTxns);
-
-            // 4. Persist records
+            // Pass config into engine
+            List<ReconciliationRecord> records = engine.match(run, gatewayTxns, fineractTxns, config);
             recordRepository.saveAll(records);
 
-            // 5. Update run counts
             run.setMatchedCount((int) records.stream().filter(r -> r.getStatus() == ReconciliationStatus.MATCHED).count());
             run.setMissingInFineractCount((int) records.stream().filter(r -> r.getStatus() == ReconciliationStatus.MISSING_IN_FINERACT).count());
             run.setMissingInGatewayCount((int) records.stream().filter(r -> r.getStatus() == ReconciliationStatus.MISSING_IN_GATEWAY).count());
@@ -100,14 +100,16 @@ public class ReconciliationService {
             run.setCompletedAt(LocalDateTime.now());
             runRepository.save(run);
 
-            log.info("Reconciliation completed: {} matched, {} missing in Fineract, {} mismatches",
-                    run.getMatchedCount(), run.getMissingInFineractCount(), run.getAmountMismatchCount());
+            // Notify based on per-SACCO config thresholds
+            boolean shouldNotify = config.getNotifyTreasurerOnDiscrepancy()
+                    && run.getUnresolvedCount() >= config.getAlertThresholdCount();
 
-            // 6. Publish event — notification-service sends summary to treasurer
-            if (run.getUnresolvedCount() > 0) {
+            if (config.getNotifyOnEveryRun() || shouldNotify) {
                 eventPublisher.publishDiscrepanciesFound(run);
             }
 
+            log.info("Reconciliation done: {} matched, {} missing in Fineract, {} mismatches",
+                    run.getMatchedCount(), run.getMissingInFineractCount(), run.getAmountMismatchCount());
             return run;
 
         } catch (Exception e) {
@@ -115,102 +117,63 @@ public class ReconciliationService {
             run.setErrorMessage(e.getMessage());
             run.setCompletedAt(LocalDateTime.now());
             runRepository.save(run);
-            log.error("Reconciliation run failed: {}", e.getMessage(), e);
+            log.error("Reconciliation failed: {}", e.getMessage(), e);
             throw new BusinessException("Reconciliation failed: " + e.getMessage());
         }
     }
 
-    // ── Run all providers for a SACCO ────────────────────────────────
-
     @Transactional
     public void runAllProviders(String saccoCode, LocalDate date, String triggeredBy) {
-        for (PaymentProvider provider : List.of(
-                PaymentProvider.MPESA, PaymentProvider.TIGOPESA, PaymentProvider.AIRTEL_MONEY)) {
+        ReconciliationConfig config = configService.resolveConfig(saccoCode);
+        // Only run providers configured for this SACCO
+        config.getActiveProviders().forEach(provider -> {
             try {
                 runReconciliation(ReconciliationRunRequest.builder()
-                        .saccoCode(saccoCode)
-                        .provider(provider)
-                        .date(date)
-                        .build(), triggeredBy);
+                        .saccoCode(saccoCode).provider(provider).date(date).build(), triggeredBy);
             } catch (Exception e) {
                 log.error("Failed to reconcile {} for {}: {}", provider, saccoCode, e.getMessage());
             }
-        }
+        });
     }
-
-    // ── Resolve discrepancy ──────────────────────────────────────────
 
     @Transactional
     public void resolveDiscrepancy(UUID recordId, ResolveDiscrepancyRequest request, String resolvedBy) {
         ReconciliationRecord record = recordRepository.findById(recordId)
                 .orElseThrow(() -> new BusinessException("Record not found: " + recordId));
-
         switch (request.getAction()) {
-            case "IGNORE" -> {
-                record.setStatus(ReconciliationStatus.IGNORED);
-                record.setResolutionNote(request.getNotes());
-            }
-            case "MARK_RESOLVED" -> {
-                record.setStatus(ReconciliationStatus.RESOLVED);
-                record.setResolutionNote(request.getNotes());
-            }
-            default -> throw new BusinessException("Unknown resolution action: " + request.getAction());
+            case "IGNORE" -> record.setStatus(ReconciliationStatus.IGNORED);
+            case "MARK_RESOLVED" -> record.setStatus(ReconciliationStatus.RESOLVED);
+            default -> throw new BusinessException("Unknown action: " + request.getAction());
         }
-
         record.setResolvedBy(resolvedBy);
         record.setResolvedAt(LocalDateTime.now());
+        record.setResolutionNote(request.getNotes());
         recordRepository.save(record);
 
-        // Update parent run unresolved count
         ReconciliationRun run = record.getReconciliationRun();
         run.setUnresolvedCount(Math.max(0, run.getUnresolvedCount() - 1));
         runRepository.save(run);
     }
 
-    // ── Resolve unmatched payment ────────────────────────────────────
-
     @Transactional
     public void resolveUnmatchedPayment(UUID unmatchedId, ResolveDiscrepancyRequest request, String resolvedBy) {
         UnmatchedPayment payment = unmatchedPaymentRepository.findById(unmatchedId)
                 .orElseThrow(() -> new BusinessException("Unmatched payment not found: " + unmatchedId));
-
-        if (payment.isResolved()) {
-            throw new BusinessException("Payment already resolved.");
-        }
-
+        if (payment.isResolved()) throw new BusinessException("Payment already resolved.");
         payment.setResolved(true);
         payment.setResolvedBy(resolvedBy);
         payment.setResolvedAt(LocalDateTime.now());
         payment.setResolutionAction(request.getAction());
         unmatchedPaymentRepository.save(payment);
-
-        log.info("Unmatched payment {} resolved by {} — action: {}",
-                payment.getGatewayReference(), resolvedBy, request.getAction());
     }
 
-    // ── Queries ──────────────────────────────────────────────────────
-
-    public ReconciliationSummary getSummary(String saccoCode, LocalDate date, PaymentProvider provider) {
+    public ReconciliationSummary getSummary(String saccoCode, LocalDate date,
+            com.reimagineafrica.reconciliation.enums.PaymentProvider provider) {
         ReconciliationRun run = runRepository
                 .findBySaccoCodeAndProviderAndReconciliationDate(saccoCode, provider, date)
                 .orElseThrow(() -> new BusinessException("No reconciliation run found."));
-
-        return toSummary(run);
-    }
-
-    public Page<ReconciliationRecord> getDiscrepancies(String saccoCode, Pageable pageable) {
-        return recordRepository.findUnresolvedBySacco(saccoCode, pageable);
-    }
-
-    public Page<UnmatchedPayment> getUnmatchedPayments(String saccoCode, Pageable pageable) {
-        return unmatchedPaymentRepository
-                .findBySaccoCodeAndResolvedFalseOrderByCreatedAtDesc(saccoCode, pageable);
-    }
-
-    private ReconciliationSummary toSummary(ReconciliationRun run) {
         return ReconciliationSummary.builder()
-                .saccoCode(run.getSaccoCode())
-                .date(run.getReconciliationDate())
+                .saccoCode(run.getSaccoCode()).date(run.getReconciliationDate())
                 .provider(run.getProvider().name())
                 .totalGateway(run.getTotalGatewayTransactions())
                 .totalFineract(run.getTotalFineractTransactions())
@@ -220,9 +183,17 @@ public class ReconciliationService {
                 .amountMismatch(run.getAmountMismatchCount())
                 .duplicates(run.getDuplicateCount())
                 .unresolved(run.getUnresolvedCount())
-                .unmatchedPaymentsCount(unmatchedPaymentRepository.countBySaccoCodeAndResolvedFalse(run.getSaccoCode()))
+                .unmatchedPaymentsCount(unmatchedPaymentRepository.countBySaccoCodeAndResolvedFalse(saccoCode))
                 .runStatus(run.getRunStatus())
                 .completedAt(run.getCompletedAt() != null ? run.getCompletedAt().toString() : null)
                 .build();
+    }
+
+    public Page<ReconciliationRecord> getDiscrepancies(String saccoCode, Pageable pageable) {
+        return recordRepository.findUnresolvedBySacco(saccoCode, pageable);
+    }
+
+    public Page<UnmatchedPayment> getUnmatchedPayments(String saccoCode, Pageable pageable) {
+        return unmatchedPaymentRepository.findBySaccoCodeAndResolvedFalseOrderByCreatedAtDesc(saccoCode, pageable);
     }
 }
